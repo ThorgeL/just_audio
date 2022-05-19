@@ -15,7 +15,27 @@ import 'package:path_provider/path_provider.dart';
 import 'package:rxdart/rxdart.dart';
 import 'package:uuid/uuid.dart';
 
-final _uuid = Uuid();
+const _uuid = Uuid();
+
+JustAudioPlatform? _pluginPlatformCache;
+
+JustAudioPlatform get _pluginPlatform {
+  var pluginPlatform = JustAudioPlatform.instance;
+  // If this is a new FlutterEngine or if we've just hot restarted an existing
+  // FlutterEngine...
+  if (_pluginPlatformCache == null) {
+    // Dispose of all existing players within this FlutterEngine. This helps to
+    // shut down existing players on a hot restart. TODO: Remove this hack once
+    // https://github.com/flutter/flutter/issues/10437 is implemented.
+    try {
+      pluginPlatform.disposeAllPlayers(DisposeAllPlayersRequest());
+    } catch (e) {
+      // Silently ignore if a platform doesn't support this method.
+    }
+    _pluginPlatformCache = pluginPlatform;
+  }
+  return pluginPlatform;
+}
 
 /// An object to manage playing audio from a URL, a locale file or an asset.
 ///
@@ -74,7 +94,7 @@ class AudioPlayer {
   StreamSubscription? _playerDataSubscription;
 
   final String _id;
-  _ProxyHttpServer? _proxy;
+  final _proxy = _ProxyHttpServer();
   AudioSource? _audioSource;
   final Map<String, AudioSource> _audioSources = {};
   bool _disposed = false;
@@ -209,7 +229,8 @@ class AudioPlayer {
             .handleError((Object err, StackTrace stackTrace) {/* noop */}));
     _shuffleModeEnabledSubject.add(false);
     _loopModeSubject.add(LoopMode.off);
-    _setPlatformActive(false, force: true)?.catchError((dynamic e) {});
+    _setPlatformActive(false, force: true)
+        ?.catchError((dynamic e) async => null);
     _sequenceSubject.add(null);
     // Respond to changes to AndroidAudioAttributes configuration.
     if (androidApplyAudioAttributes && _isAndroid()) {
@@ -284,6 +305,7 @@ class AudioPlayer {
         try {
           oldAssetCacheDir.deleteSync(recursive: true);
         } catch (e) {
+          // ignore: avoid_print
           print("Failed to delete old asset cache dir: $e");
         }
       }
@@ -517,8 +539,8 @@ class AudioPlayer {
       if (!_disposed) {
         _positionSubject!.addStream(createPositionStream(
             steps: 800,
-            minPeriod: Duration(milliseconds: 16),
-            maxPeriod: Duration(milliseconds: 200)));
+            minPeriod: const Duration(milliseconds: 16),
+            maxPeriod: const Duration(milliseconds: 200)));
       }
     }
     return _positionSubject!.stream;
@@ -682,7 +704,7 @@ class AudioPlayer {
     if (preload) {
       duration = await load();
     } else {
-      await _setPlatformActive(false)?.catchError((dynamic e) {});
+      await _setPlatformActive(false)?.catchError((dynamic e) async => null);
     }
     return duration;
   }
@@ -750,13 +772,6 @@ class AudioPlayer {
     }
 
     try {
-      if (!kIsWeb && (source._requiresProxy || _userAgent != null)) {
-        if (_proxy == null) {
-          _proxy = _ProxyHttpServer();
-          await _proxy!.start();
-          checkInterruption();
-        }
-      }
       await source._setup(this);
       checkInterruption();
       source._shuffle(initialIndex: initialSeekValues?.index ?? 0);
@@ -800,7 +815,7 @@ class AudioPlayer {
   /// [ProcessingState.idle] state.
   Future<Duration?> setClip({Duration? start, Duration? end}) async {
     if (_disposed) return null;
-    _setPlatformActive(true)?.catchError((dynamic e) {});
+    _setPlatformActive(true)?.catchError((dynamic e) async => null);
     final duration = await _load(
         await _platform,
         start == null && end == null
@@ -846,6 +861,7 @@ class AudioPlayer {
     final playCompleter = Completer<dynamic>();
     final audioSession = await AudioSession.instance;
     if (!_handleAudioSessionActivation || await audioSession.setActive(true)) {
+      if (!playing) return;
       // TODO: rewrite this to more cleanly handle simultaneous load/play
       // requests which each may result in platform play requests.
       final requireActive = _audioSource != null;
@@ -860,7 +876,7 @@ class AudioPlayer {
           // If the native platform wasn't already active, activating it will
           // implicitly restore the playing state and send a play request.
           _setPlatformActive(true, playCompleter: playCompleter)
-              ?.catchError((dynamic e) {});
+              ?.catchError((dynamic e) async => null);
         }
       }
     } else {
@@ -892,6 +908,7 @@ class AudioPlayer {
   Future<void> _sendPlayRequest(
       AudioPlayerPlatform platform, Completer<void>? playCompleter) async {
     try {
+      if (!playing) return; // defensive
       await platform.play(PlayRequest());
       playCompleter?.complete();
     } catch (e, stackTrace) {
@@ -909,7 +926,8 @@ class AudioPlayer {
   /// decoders alive so that the app can quickly resume audio playback.
   Future<void> stop() async {
     if (_disposed) return;
-    final future = _setPlatformActive(false)?.catchError((dynamic e) {});
+    final future =
+        _setPlatformActive(false)?.catchError((dynamic e) async => null);
 
     _playInterrupted = false;
     // Update local state immediately so that queries aren't surprised.
@@ -1102,9 +1120,11 @@ class AudioPlayer {
       _idlePlatform = null;
     }
     _audioSource = null;
-    _audioSources.values.forEach((s) => s._dispose());
+    for (var s in _audioSources.values) {
+      s._dispose();
+    }
     _audioSources.clear();
-    _proxy?.stop();
+    _proxy.stop();
     await _durationSubject.close();
     await _loopModeSubject.close();
     await _shuffleModeEnabledSubject.close();
@@ -1239,7 +1259,7 @@ class AudioPlayer {
         if (_playbackEvent.processingState !=
                 oldPlaybackEvent.processingState &&
             _playbackEvent.processingState == ProcessingState.idle) {
-          _setPlatformActive(false)?.catchError((dynamic e) {});
+          _setPlatformActive(false)?.catchError((dynamic e) async => null);
         }
       }, onError: _playbackEventSubject.addError);
     }
@@ -1249,7 +1269,7 @@ class AudioPlayer {
       _playerDataSubscription?.cancel();
       if (!force) {
         final oldPlatform = _platformValue!;
-        if (!(oldPlatform is _IdleAudioPlayer)) {
+        if (oldPlatform is! _IdleAudioPlayer) {
           await _disposePlatform(oldPlatform);
         }
       }
@@ -1257,8 +1277,7 @@ class AudioPlayer {
       // During initialisation, we must only use this platform reference in case
       // _platform is updated again during initialisation.
       final platform = active
-          ? await (_nativePlatform =
-              JustAudioPlatform.instance.init(InitRequest(
+          ? await (_nativePlatform = _pluginPlatform.init(InitRequest(
               id: _id,
               audioLoadConfiguration: _audioLoadConfiguration?._toMessage(),
               androidAudioEffects: (_isAndroid() || _isUnitTest())
@@ -1353,7 +1372,8 @@ class AudioPlayer {
           if (checkInterruption()) return platform;
           durationCompleter.complete(duration);
         } catch (e, stackTrace) {
-          await _setPlatformActive(false)?.catchError((dynamic e) {});
+          await _setPlatformActive(false)
+              ?.catchError((dynamic e) async => null);
           durationCompleter.completeError(e, stackTrace);
         }
       } else {
@@ -1372,7 +1392,7 @@ class AudioPlayer {
 
     _platform = setPlatform();
     if (_active) {
-      initAudioEffects().catchError((dynamic e) {});
+      initAudioEffects().catchError((dynamic e) async {});
     }
     return durationCompleter.future;
   }
@@ -1384,8 +1404,7 @@ class AudioPlayer {
     } else {
       _nativePlatform = null;
       try {
-        await JustAudioPlatform.instance
-            .disposePlayer(DisposePlayerRequest(id: _id));
+        await _pluginPlatform.disposePlayer(DisposePlayerRequest(id: _id));
       } catch (e) {
         // Fallback if disposePlayer hasn't been implemented.
         await platform.dispose(DisposeRequest());
@@ -1869,6 +1888,7 @@ class AndroidLivePlaybackSpeedControl {
 /// A local proxy HTTP server for making remote GET requests with headers.
 class _ProxyHttpServer {
   late HttpServer _server;
+  bool _running = false;
 
   /// Maps request keys to [_ProxyHandler]s.
   final Map<String, _ProxyHandler> _handlerMap = {};
@@ -1915,8 +1935,15 @@ class _ProxyHttpServer {
   /// but differ in other respects such as the port or headers.
   String _requestKey(Uri uri) => '${uri.path}?${uri.query}';
 
+  /// Start the server if it is not already running.
+  Future ensureRunning() async {
+    if (_running) return;
+    return await start();
+  }
+
   /// Starts the server.
   Future start() async {
+    _running = true;
     _server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     _server.listen((request) async {
       if (request.method == 'GET') {
@@ -1924,11 +1951,19 @@ class _ProxyHttpServer {
         final handler = _handlerMap[uriPath]!;
         handler(request);
       }
+    }, onDone: () {
+      _running = false;
+    }, onError: (Object e, StackTrace st) {
+      _running = false;
     });
   }
 
   /// Stops the server
-  Future stop() => _server.close();
+  Future stop() async {
+    if (!_running) return;
+    _running = false;
+    return await _server.close();
+  }
 }
 
 /// Encapsulates the start and end of an HTTP range request.
@@ -1945,7 +1980,11 @@ class _HttpRangeRequest {
 
   _HttpRangeRequest(this.start, this.end);
 
-  /// Creates an [_HttpRange] from [header].
+  /// Format a range header for this request.
+  String get header =>
+      'bytes=$start-${end != null ? (end! - 1).toString() : ""}';
+
+  /// Creates an [_HttpRangeRequest] from [header].
   static _HttpRangeRequest? parse(List<String>? header) {
     if (header == null || header.isEmpty) return null;
     final match = RegExp(r'^bytes=(\d+)(-(\d+)?)?').firstMatch(header.first);
@@ -1956,28 +1995,26 @@ class _HttpRangeRequest {
 }
 
 /// Encapsulates the range information in an HTTP range response.
-class _HttpRange {
+class _HttpRangeResponse {
   /// The starting byte position of the range.
   final int start;
 
-  /// The last byte position of the range, or `null` if until the end of the
-  /// media.
-  final int? end;
+  /// The last byte position of the range.
+  final int end;
 
   /// The total number of bytes in the entire media.
   final int? fullLength;
 
-  _HttpRange(this.start, this.end, this.fullLength);
+  _HttpRangeResponse(this.start, this.end, this.fullLength);
 
-  /// The end byte position (exclusive), defaulting to [fullLength].
-  int? get endEx => end == null ? fullLength : end! + 1;
+  /// The end byte position (exclusive).
+  int? get endEx => end + 1;
 
   /// The number of bytes requested.
   int? get length => endEx == null ? null : endEx! - start;
 
   /// The content-range header value to use in HTTP responses.
-  String get contentRangeHeader =>
-      'bytes $start-${end?.toString() ?? ""}/$fullLength';
+  String get header => 'bytes $start-$end/${fullLength?.toString() ?? "*"}';
 }
 
 /// Specifies a source of audio to be played. Audio sources are composable
@@ -2032,8 +2069,6 @@ abstract class AudioSource {
 
   AudioSourceMessage _toMessage();
 
-  bool get _requiresProxy;
-
   List<IndexedAudioSource> get sequence;
 
   List<int> get shuffleIndices;
@@ -2087,7 +2122,8 @@ abstract class UriAudioSource extends IndexedAudioSource {
     } else if (uri.scheme != 'file' &&
         !kIsWeb &&
         (headers != null || player._userAgent != null)) {
-      _overrideUri = player._proxy!.addUriAudioSource(this);
+      await player._proxy.ensureRunning();
+      _overrideUri = player._proxy.addUriAudioSource(this);
     }
   }
 
@@ -2137,9 +2173,6 @@ abstract class UriAudioSource extends IndexedAudioSource {
         'assets',
         ...Uri.parse(assetPath).pathSegments,
       ]));
-
-  @override
-  bool get _requiresProxy => uri.scheme != 'file' && headers != null && !kIsWeb;
 }
 
 /// An [AudioSource] representing a regular media file such as an MP3 or M4A
@@ -2226,9 +2259,6 @@ class SilenceAudioSource extends IndexedAudioSource {
     dynamic tag,
     required Duration duration,
   }) : super(tag: tag, duration: duration);
-
-  @override
-  bool get _requiresProxy => false;
 
   @override
   AudioSourceMessage _toMessage() =>
@@ -2360,7 +2390,7 @@ class ConcatenatingAudioSource extends AudioSource {
     }
   }
 
-  /// (Untested) Dynmaically remove an [AudioSource] at [index] after this
+  /// (Untested) Dynamically remove an [AudioSource] at [index] after this
   /// [ConcatenatingAudioSource] has already been loaded.
   Future<void> removeAt(int index) async {
     children.removeAt(index);
@@ -2449,9 +2479,6 @@ class ConcatenatingAudioSource extends AudioSource {
   }
 
   @override
-  bool get _requiresProxy => children.any((source) => source._requiresProxy);
-
-  @override
   AudioSourceMessage _toMessage() => ConcatenatingAudioSourceMessage(
       id: _id,
       children: children.map((child) => child._toMessage()).toList(),
@@ -2482,9 +2509,6 @@ class ClippingAudioSource extends IndexedAudioSource {
     await super._setup(player);
     await child._setup(player);
   }
-
-  @override
-  bool get _requiresProxy => child._requiresProxy;
 
   @override
   AudioSourceMessage _toMessage() => ClippingAudioSourceMessage(
@@ -2524,9 +2548,6 @@ class LoopingAudioSource extends AudioSource {
   List<int> get shuffleIndices => List.generate(count, (i) => i);
 
   @override
-  bool get _requiresProxy => child._requiresProxy;
-
-  @override
   AudioSourceMessage _toMessage() => LoopingAudioSourceMessage(
       id: _id, child: child._toMessage(), count: count);
 }
@@ -2549,7 +2570,8 @@ abstract class StreamAudioSource extends IndexedAudioSource {
       _uri = _encodeDataUrl(await base64.encoder.bind(response.stream).join(),
           response.contentType);
     } else {
-      _uri = player._proxy!.addStreamAudioSource(this);
+      await player._proxy.ensureRunning();
+      _uri = player._proxy.addStreamAudioSource(this);
     }
   }
 
@@ -2561,9 +2583,6 @@ abstract class StreamAudioSource extends IndexedAudioSource {
   Future<StreamAudioResponse> request([int? start, int? end]);
 
   @override
-  bool get _requiresProxy => !kIsWeb;
-
-  @override
   AudioSourceMessage _toMessage() => ProgressiveAudioSourceMessage(
       id: _id, uri: _uri.toString(), headers: null, tag: tag);
 }
@@ -2571,14 +2590,24 @@ abstract class StreamAudioSource extends IndexedAudioSource {
 /// The response for a [StreamAudioSource]. This API is experimental.
 @experimental
 class StreamAudioResponse {
-  /// The total number of bytes available.
-  final int sourceLength;
+  /// Indicates to the client whether or not range requests are supported for
+  /// the requested media. If `true`, the client may make further requests
+  /// specifying the `start` and possibly also the `end` parameters of the range
+  /// request, otherwise these will both be null.
+  final bool rangeRequestsSupported;
 
-  /// The number of bytes returned in this response.
-  final int contentLength;
+  /// When responding to a range request, this holds the byte length of the
+  /// entire media, otherwise it holds `null`.
+  final int? sourceLength;
 
-  /// The starting byte position of the response data.
-  final int offset;
+  /// The number of bytes returned in this response, or `null` if unknown. Note:
+  /// this may be different from the length of the entire media for a range
+  /// request.
+  final int? contentLength;
+
+  /// The starting byte position of the response data if responding to a range
+  /// request.
+  final int? offset;
 
   /// The MIME type of the audio.
   final String contentType;
@@ -2587,6 +2616,7 @@ class StreamAudioResponse {
   final Stream<List<int>> stream;
 
   StreamAudioResponse({
+    this.rangeRequestsSupported = true,
     required this.sourceLength,
     required this.contentLength,
     required this.offset,
@@ -2641,6 +2671,7 @@ class LockCachingAudioSource extends StreamAudioSource {
     if (_downloading) {
       throw Exception("Cannot clear cache while download is in progress");
     }
+    _response = null;
     final cacheFile = await this.cacheFile;
     if (await cacheFile.exists()) {
       await cacheFile.delete();
@@ -2649,6 +2680,7 @@ class LockCachingAudioSource extends StreamAudioSource {
     if (await mimeFile.exists()) {
       await mimeFile.delete();
     }
+    _progress = 0;
     _downloadProgressSubject.add(0.0);
   }
 
@@ -2693,7 +2725,6 @@ class LockCachingAudioSource extends StreamAudioSource {
     _downloading = true;
     final cacheFile = await this.cacheFile;
     final partialCacheFile = await _partialCacheFile;
-    final mimeType = await _readCachedMimeType();
 
     File getEffectiveCacheFile() =>
         partialCacheFile.existsSync() ? partialCacheFile : cacheFile;
@@ -2713,28 +2744,53 @@ class LockCachingAudioSource extends StreamAudioSource {
     // TODO: Should close sink after done, but it throws an error.
     // ignore: close_sinks
     final sink = (await _partialCacheFile).openWrite();
-    var sourceLength = response.contentLength;
+    final sourceLength =
+        response.contentLength == -1 ? null : response.contentLength;
+    final mimeType = response.headers.contentType.toString();
+    final acceptRanges = response.headers.value(HttpHeaders.acceptRangesHeader);
+    final originSupportsRangeRequests =
+        acceptRanges != null && acceptRanges != 'none';
+    final mimeFile = await _mimeFile;
+    await mimeFile.writeAsString(mimeType);
     final inProgressResponses = <_InProgressCacheResponse>[];
     late StreamSubscription subscription;
     var percentProgress = 0;
-    subscription = response.listen((data) async {
-      _progress += data.length;
-      final newPercentProgress = 100 * _progress ~/ sourceLength;
+    void updateProgress(int newPercentProgress) {
       if (newPercentProgress != percentProgress) {
         percentProgress = newPercentProgress;
         _downloadProgressSubject.add(percentProgress / 100);
       }
+    }
+
+    _progress = 0;
+    subscription = response.listen((data) async {
+      _progress += data.length;
+      final newPercentProgress = (sourceLength == null)
+          ? 0
+          : (sourceLength == 0)
+              ? 100
+              : (100 * _progress ~/ sourceLength);
+      updateProgress(newPercentProgress);
       sink.add(data);
-      final readyRequests =
-          _requests.where((request) => (request.start) < _progress).toList();
-      final notReadyRequests =
-          _requests.where((request) => (request.start) >= _progress).toList();
+      final readyRequests = _requests
+          .where((request) =>
+              !originSupportsRangeRequests ||
+              request.start == null ||
+              (request.start!) < _progress)
+          .toList();
+      final notReadyRequests = _requests
+          .where((request) =>
+              originSupportsRangeRequests &&
+              request.start != null &&
+              (request.start!) >= _progress)
+          .toList();
       // Add this live data to any responses in progress.
       for (var cacheResponse in inProgressResponses) {
-        if (_progress >= cacheResponse.end) {
+        final end = cacheResponse.end;
+        if (end != null && _progress >= end) {
           // We've received enough data to fulfill the byte range request.
-          final subEnd = min(data.length,
-              max(0, data.length - (_progress - cacheResponse.end)));
+          final subEnd =
+              min(data.length, max(0, data.length - (_progress - end)));
           cacheResponse.controller.add(data.sublist(0, subEnd));
           cacheResponse.controller.close();
         } else {
@@ -2750,67 +2806,90 @@ class LockCachingAudioSource extends StreamAudioSource {
       // Process any requests that start within the cache.
       for (var request in readyRequests) {
         _requests.remove(request);
-        final start = request.start;
-        final end = request.end ?? sourceLength;
-        Stream<List<int>> responseStream;
-        if (end <= _progress) {
-          responseStream = getEffectiveCacheFile().openRead(start, end);
+        int? start, end;
+        if (originSupportsRangeRequests) {
+          start = request.start;
+          end = request.end;
         } else {
-          final cacheResponse = _InProgressCacheResponse(end: end);
+          // If the origin doesn't support range requests, the proxy should also
+          // ignore range requests and instead serve a complete 200 response
+          // which the client (AV or exo player) should know how to deal with.
+        }
+        final effectiveStart = start ?? 0;
+        final effectiveEnd = end ?? sourceLength;
+        Stream<List<int>> responseStream;
+        if (effectiveEnd != null && effectiveEnd <= _progress) {
+          responseStream =
+              getEffectiveCacheFile().openRead(effectiveStart, effectiveEnd);
+        } else {
+          final cacheResponse = _InProgressCacheResponse(end: effectiveEnd);
           inProgressResponses.add(cacheResponse);
           responseStream = Rx.concatEager([
             // NOTE: The cache file part of the stream must not overlap with
             // the live part. "_progress" should
             // to the cache file at the time
-            getEffectiveCacheFile().openRead(start, _progress),
+            getEffectiveCacheFile().openRead(effectiveStart, _progress),
             cacheResponse.controller.stream,
           ]);
         }
         request.complete(StreamAudioResponse(
-          sourceLength: sourceLength,
-          contentLength: end - start,
+          rangeRequestsSupported: originSupportsRangeRequests,
+          sourceLength: start != null ? sourceLength : null,
+          contentLength:
+              effectiveEnd != null ? effectiveEnd - effectiveStart : null,
           offset: start,
           contentType: mimeType,
-          stream: responseStream,
+          stream: responseStream.asBroadcastStream(),
         ));
       }
       subscription.resume();
       // Process any requests that start beyond the cache.
       for (var request in notReadyRequests) {
         _requests.remove(request);
-        final start = request.start;
+        final start = request.start!;
         final end = request.end ?? sourceLength;
+        final httpClient = HttpClient();
         httpClient.getUrl(uri).then((httpRequest) async {
           if (headers != null) {
             httpRequest.headers.clear();
             headers!
                 .forEach((name, value) => httpRequest.headers.set(name, value));
           }
-          httpRequest.headers
-              .set(HttpHeaders.rangeHeader, 'bytes=$start-${end - 1}');
+          final rangeRequest = _HttpRangeRequest(start, end);
+          httpRequest.headers.set(HttpHeaders.rangeHeader, rangeRequest.header);
           final response = await httpRequest.close();
           if (response.statusCode != 206) {
             httpClient.close();
             throw Exception('HTTP Status Error: ${response.statusCode}');
           }
           request.complete(StreamAudioResponse(
+            rangeRequestsSupported: originSupportsRangeRequests,
             sourceLength: sourceLength,
-            contentLength: end - start,
+            contentLength: end != null ? end - start : null,
             offset: start,
             contentType: mimeType,
-            stream: response,
+            stream: response.asBroadcastStream(),
           ));
         }, onError: (dynamic e, StackTrace? stackTrace) {
           request.fail(e, stackTrace);
+        }).onError((Object e, StackTrace st) {
+          request.fail(e, st);
         });
       }
     }, onDone: () async {
-      (await _partialCacheFile).renameSync((await cacheFile).path);
+      if (sourceLength == null) {
+        updateProgress(100);
+      }
+      for (var cacheResponse in inProgressResponses) {
+        if (!cacheResponse.controller.isClosed) {
+          cacheResponse.controller.close();
+        }
+      }
+      (await _partialCacheFile).renameSync(cacheFile.path);
       await subscription.cancel();
       httpClient.close();
       _downloading = false;
     }, onError: (Object e, StackTrace stackTrace) async {
-      print(stackTrace);
       (await _partialCacheFile).deleteSync();
       httpClient.close();
       // Fail all pending requests
@@ -2831,29 +2910,40 @@ class LockCachingAudioSource extends StreamAudioSource {
   @override
   Future<StreamAudioResponse> request([int? start, int? end]) async {
     final cacheFile = await this.cacheFile;
-    start ??= 0;
     if (cacheFile.existsSync()) {
       final sourceLength = cacheFile.lengthSync();
-      end ??= sourceLength;
       return StreamAudioResponse(
-        sourceLength: sourceLength,
-        contentLength: end - start,
+        rangeRequestsSupported: true,
+        sourceLength: start != null ? sourceLength : null,
+        contentLength: (end ?? sourceLength) - (start ?? 0),
         offset: start,
         contentType: await _readCachedMimeType(),
-        stream: cacheFile.openRead(start, end),
+        stream: cacheFile.openRead(start, end).asBroadcastStream(),
       );
     }
     final byteRangeRequest = _StreamingByteRangeRequest(start, end);
     _requests.add(byteRangeRequest);
-    _response ??= _fetch().catchError((dynamic error, StackTrace? stackTrace) {
+    _response ??=
+        _fetch().catchError((dynamic error, StackTrace? stackTrace) async {
       // So that we can restart later
       _response = null;
       // Cancel any pending request
       for (final req in _requests) {
         req.fail(error, stackTrace);
       }
+      return Future<HttpClientResponse>.error(error as Object, stackTrace);
     });
-    return byteRangeRequest.future;
+    return byteRangeRequest.future.then((response) {
+      response.stream.listen((event) {}, onError: (Object e, StackTrace st) {
+        // So that we can restart later
+        _response = null;
+        // Cancel any pending request
+        for (final req in _requests) {
+          req.fail(e, st);
+        }
+      });
+      return response;
+    });
   }
 }
 
@@ -2871,16 +2961,16 @@ class _InProgressCacheResponse {
   // TODO: Improve this code.
   // ignore: close_sinks
   final controller = ReplaySubject<List<int>>();
-  final int end;
+  final int? end;
   _InProgressCacheResponse({
     required this.end,
   });
 }
 
-/// Request parameters for a [StreamingAudioSource].
+/// Request parameters for a [StreamAudioSource].
 class _StreamingByteRangeRequest {
   /// The start of the range request.
-  final int start;
+  final int? start;
 
   /// The end of the range request.
   final int? end;
@@ -2920,16 +3010,16 @@ _ProxyHandler _proxyHandlerForSource(StreamAudioSource source) {
         _HttpRangeRequest.parse(request.headers[HttpHeaders.rangeHeader]);
 
     request.response.headers.clear();
-    request.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
-    request.response.statusCode = rangeRequest == null ? 200 : 206;
 
     StreamAudioResponse sourceResponse;
+    Stream<List<int>> stream;
     try {
       sourceResponse =
           await source.request(rangeRequest?.start, rangeRequest?.endEx);
-    } catch (e, stackTrace) {
-      print("Proxy request failed: $e");
-      print(stackTrace);
+      stream = sourceResponse.stream;
+    } catch (e, st) {
+      // ignore: avoid_print
+      print("Proxy request failed: $e\n$st");
 
       request.response.headers.clear();
       request.response.statusCode = HttpStatus.internalServerError;
@@ -2937,18 +3027,38 @@ _ProxyHandler _proxyHandlerForSource(StreamAudioSource source) {
       return;
     }
 
-    final range = _HttpRange(rangeRequest?.start ?? 0, rangeRequest?.end,
-        sourceResponse.sourceLength);
-    request.response.contentLength = range.length!;
     request.response.headers
         .set(HttpHeaders.contentTypeHeader, sourceResponse.contentType);
-    if (rangeRequest != null) {
-      request.response.headers
-          .set(HttpHeaders.contentRangeHeader, range.contentRangeHeader);
+
+    if (sourceResponse.rangeRequestsSupported) {
+      request.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
     }
 
-    // Pipe response
-    await sourceResponse.stream.pipe(request.response);
+    if (rangeRequest != null && sourceResponse.offset != null) {
+      final range = _HttpRangeResponse(
+          sourceResponse.offset!,
+          sourceResponse.offset! + sourceResponse.contentLength! - 1,
+          sourceResponse.sourceLength);
+      request.response.contentLength = range.length ?? -1;
+      request.response.headers
+          .set(HttpHeaders.contentRangeHeader, range.header);
+      request.response.statusCode = 206;
+    } else {
+      request.response.contentLength = sourceResponse.contentLength ?? -1;
+      request.response.statusCode = 200;
+    }
+
+    final completer = Completer<void>();
+    stream.listen((event) {
+      request.response.add(event);
+    }, onError: (Object e, StackTrace st) {
+      source._player?._playbackEventSubject.addError(e, st);
+    }, onDone: () {
+      completer.complete();
+    });
+
+    await completer.future;
+
     await request.response.close();
   }
 
@@ -2968,9 +3078,9 @@ _ProxyHandler _proxyHandlerForUri(Uri uri, Map<String, String>? headers) {
     request.headers.forEach((name, value) {
       originRequest.headers.set(name, value);
     });
-    headers?.entries.forEach((entry) {
+    for (var entry in headers?.entries ?? <MapEntry<String, String>>[]) {
       originRequest.headers.set(entry.key, entry.value);
-    });
+    }
     if (host != null) {
       originRequest.headers.set('host', host);
     } else {
@@ -3079,7 +3189,7 @@ class DefaultShuffleOrder extends ShuffleOrder {
     indices.shuffle(_random);
     if (initialIndex == null) return;
 
-    final initialPos = 0;
+    const initialPos = 0;
     final swapPos = indices.indexOf(initialIndex);
     // Swap the indices at initialPos and swapPos.
     final swapIndex = indices[initialPos];
@@ -3337,7 +3447,9 @@ class AudioPipeline {
       <AudioEffect>[...androidAudioEffects, ...darwinAudioEffects];
 
   void _setup(AudioPlayer player) {
-    _audioEffects.forEach((effect) => effect._setup(player));
+    for (var effect in _audioEffects) {
+      effect._setup(player);
+    }
   }
 }
 
@@ -3363,7 +3475,7 @@ abstract class AudioEffect {
   /// Called when [_player] is connected to the platform.
   Future<void> _activate() async {}
 
-  /// Whether the the effect is enabled. When `true`, and if the effect is part
+  /// Whether the effect is enabled. When `true`, and if the effect is part
   /// of an [AudioPipeline] attached to an [AudioPlayer], the effect will modify
   /// the audio player's output. When `false`, the audio pipeline will still
   /// reserve platform resources for the effect but the effect will be bypassed.
